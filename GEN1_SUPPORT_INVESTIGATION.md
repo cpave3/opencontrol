@@ -88,6 +88,9 @@ unrecognised.
 | Codec and UI capability gating | ~2–3 days | low |
 | Per-capability Gen 1 enablement | small per item | dominated by hardware verification |
 
+> **Update (2026-11-01):** the press-and-hold **Assistant** gesture is not part of Maestro. It uses two separate Google services ("GSND"). Both
+> were captured and decoded on Gen 1, and a third-party client (Psi) now drives them. See [§11](#11-assistant-channel-gsnd-on-gen-1).
+
 ---
 
 ## 2. Architecture of the three projects
@@ -735,3 +738,112 @@ written into a `CAP-NNN-FINDINGS.md`.
 4. Field-by-field `ReadSetting` status on Gen 1 for 1–29.
 5. The official app's Gen 1 connect burst and every write's bytes (M2).
 6. Whether the Gen 1 official app exposes conversation detection, volume EQ and mono on `release_5.11_signed`. This decides `readable`.
+
+---
+
+## 11. Assistant channel (GSND) on Gen 1
+
+Added 2026-11-01. The press-and-hold "Assistant" gesture does not travel over Maestro, the Fast Pair stream or HFP (`AT+BVRA`). It uses two further RFCOMM
+services that Google's assistant software (the Google app's "Bisto" component) keeps open. This section records what was found on the Gen 1. It is not
+implemented in OpenControl: the personal assistant app Psi owns these channels.
+
+### 11.1 Sources and evidence
+
+| Source | What it gives |
+|---|---|
+| HCI snoop of the Google app + Gen 1 (`release_5.11_signed`), Pixel 4 XL, Android 13, Google Assistant, 2026-11-01 17:48 | The whole connection from a fresh Bluetooth start: SDP, every RFCOMM open, four assistant holds. Not published (it carries device identifiers). |
+| Psi's client (Pixel 9 Pro, Android 17) against the same buds | Handshake replayed without Google's app; holds, microphone audio and releases received (**G1-HW** for Psi's client). |
+| `scripts/btsnoop_rfcomm.py`, `scripts/gsnd_control_decode.py` | btsnoop → RFCOMM frames per DLCI; GSND CONTROL messages decoded. |
+| Psi's write-up `gsnd-pixel-buds-assistant.md` (Cameron's personal-ai-agent repo, `packages/psi-android/docs/`) | The full protocol description, the SBC decoding and Psi's implementation. This section is a summary of it plus our own decode of the capture. |
+| [BlueZ issue #963](https://github.com/bluez/bluez/issues/963) (2024) | The only earlier public mention found: the two UUIDs as "Gsound data (control)" / "Gsound voice (audio)", "AudioWear" on Windows. No protocol. |
+| [pbpctrl issue #13](https://github.com/qzed/pbpctrl/issues/13) (2024) | "not via the maestro protocol" — the open question this answers. |
+| OpenControl `PROTOCOL.md` (Pro 2 captures) | Names GSND CONTROL, the `01 09` assistant-session opener and wear codes (lines 622–630, 2915–2918, 3797–3826). Never decodes the payloads. |
+
+No public description of the GSND wire format, the connect handshake, or a third-party GSND client was found (web search, 2026-11-01).
+
+### 11.2 Services on the Gen 1
+
+The Gen 1's SDP records (`adb shell dumpsys bluetooth_manager` on the Pixel 9 Pro, and the capture's SDP exchange):
+
+| UUID | Service | DLCI in the capture |
+|---|---|---|
+| `0000110b-…`, `0000110e-…`, `0000111e-…`, `00001124-…` | A2DP sink, AVRCP, HFP, HID | HFP was 0x0c |
+| `25e97ff7-24ce-4c4c-8951-f764a708f7b5` | Maestro (settings; this app) | 0x02 |
+| `df21fe2c-2515-4fdb-8886-f12c4d67927c` | Google Fast Pair message stream | 0x04 |
+| `f8d1fbe4-7966-4334-8024-ff96c9330e15` | **GSND CONTROL** | 0x08 |
+| `81c2e72a-0591-443e-a1ff-05f988593351` | **GSND AUDIO** | 0x0a |
+| `74c34f02-a774-4f6d-ae2e-dab5030b5842` | unnamed (not opened in the capture) | — |
+
+Look services up by UUID; the DLCIs are what the buds assigned in this capture.
+
+### 11.3 Framing
+
+Both GSND channels use `[group:1][code:1][length:2, big-endian][value]`, the same framing as the Fast Pair message stream. The value is a protobuf message or
+empty. Several messages can share one RFCOMM frame, and one message can span two.
+
+### 11.4 Connect handshake (phone → buds, GSND CONTROL)
+
+The Google app opens GSND AUDIO first (17:48:11.353), then GSND CONTROL (11.490). Right after the CONTROL channel's SABM/UA and MSC it sends one frame (11.574):
+
+```
+05 0c 00 00 | 04 02 00 00 | 04 04 00 00 | 04 11 00 00 | 04 13 00 00 | 04 15 00 00 | 0e 04 00 00 | 09 03 00 00
+03 01 00 1b  08 a1 03  10 a2 bc f6 ae 09  1a 10 "Australia/Sydney"
+```
+
+- Eight empty requests (which are required is untested).
+- `03 01 {1:417 2:2514329122 3:"Australia/Sydney"}`: the phone's clock and timezone. Fields 1 and 2 are Unix time in ms, high and low 32 bits:
+  (417 << 32) + 2514329122 = 1793515691554 = 17:48:11.554 local time, 20 ms before the frame was sent. Checked independently by both agents.
+- No nonce, key or signature. Psi replays the handshake with its own clock and succeeds.
+
+The buds answer at once (11.615–11.817):
+
+| Message | Value | Reading |
+|---|---|---|
+| `05 0a` | `{1:"72f2e91" 2:64 3:11}` | build ID, two unknowns |
+| `04 03` | `{2:5 3:100}` | unknown |
+| `04 05` | `{1:6}` | wear state, both buds (Pro 2 notes: 03 none, 04 one, 06 both — consistent) |
+| `04 12` | `{1:2 2:1}` | unknown |
+| `04 14` | `{1:2}` | possibly the right bud's hold action. Pro 2 notes say `03` = assistant; the Gen 1 shows 2 with the assistant set. **Unresolved.** |
+| `09 02` | `{1:0}` | unknown |
+| `03 02` | `{4:"0.0.1" 9:"72f2e91" …}` | device info |
+| `0e 02` | `{1:"google-pixel-buds-pro-v1"}` | model |
+| `0e 01` | `{1:{1:"all" …}}` | battery per bud and case |
+
+The phone then sends `02 05 {1:0}` and `02 05 {1:1}`, and the buds answer with one `02 04` per bud (version, side, serial, hardware string).
+
+### 11.5 A hold
+
+| Channel | Direction | Message | Meaning |
+|---|---|---|---|
+| CONTROL | buds → phone | `01 09 {1:<03 02>}` | hold started. The Pro 2 sends `{1:<03>}` (OpenControl `PROTOCOL.md` 🟢 for `CAP-069`). |
+| AUDIO | buds → phone | `01 02 {4:16000 5:8 6:16 7:24 8:0 …}` | microphone format: rate, subbands, blocks, bitpool, allocation |
+| AUDIO | buds → phone | `01 04 {1:<n × 52 bytes>}` every 50–70 ms | microphone audio |
+| CONTROL | phone → buds | `01 07 {1:16000 2:24 3:1200 4:2 5:0 6:1}` | first hold of a connection only: mic settings (16 kHz, bitpool 24; field 5 = 0 may be "include SBC headers = off"; 3, 4, 6 unknown) |
+| CONTROL | buds → phone | `01 09 {1:<01>}`, then `{1:<1f>}` | ~0.6 s in; meaning unknown (not replies to `01 07`) |
+| CONTROL | buds → phone | `01 09 {1:<05>}` | released / idle (also sent once after connecting); the audio stops |
+| AUDIO | buds → phone | `01 03` | stream end |
+| CONTROL | phone → buds | `01 08` | session over |
+
+While the Google app plays its answer it also sends `08 06 {1:0 2:1}` about every 55 ms. Psi doesn't, and the buds behave normally.
+
+### 11.6 Audio
+
+Headerless SBC: each 52-byte block is one SBC frame without its 4-byte header (16 kHz, mono, 8 subbands, 16 blocks, loudness, bitpool 24). That is 4 bytes
+of scale factors and 48 bytes of samples, 125 frames/s. Put back `9c 31 18 <CRC-8>` and FFmpeg decodes it (`ffmpeg -f sbc -i mic.sbc mic.wav`). Psi decodes it on
+the phone with a Kotlin port of BlueZ libsbc.
+
+### 11.7 What this means for OpenControl
+
+- **No conflict.** OpenControl opens Maestro as its session channel, and Fast Pair briefly for Find and the model-ID probe. It never opens GSND.
+- **One RFCOMM client per channel.** If an app holds GSND, Google's assistant can't use the buds, and the reverse. If OpenControl and Psi ever overlap, neither may open
+  the other's channels.
+- **No hold signal on Maestro.** OpenControl can't detect an Assistant hold without owning GSND. The current decision (Cameron, 2026-11-01) is that Psi owns GSND.
+- If GSND were ever added here, it would need the same governance as §6.1. The wire facts above are 🟡 at most under OpenControl's rules.
+
+### 11.8 Open questions
+
+- Which handshake requests are required, and whether the buds check `03 01`.
+- `01 07` fields 3, 4, 6; the format message's fields 1–3, 9, 12, 13; states `01` and `1f`; `08 06`.
+- `04 14`'s value meaning on Gen 1 vs Pro 2.
+- Whether Gemini's client handshakes differently (only Google Assistant was captured).
+- Whether the Pro 2, A-Series and Pixel Buds (2020) behave the same.
