@@ -50,7 +50,14 @@ sealed class SettingValue {
     }
 
     /** Field 12, `12{1:b 2:b 3:b 4:b}` — the press-and-hold ANC-mode list (`qht`; 1 NC, 2 Off, 3 Transparency, 4 Adaptive — PROTOCOL.md §4.5.3, ADR-046). */
-    data class AncModes(val list: AncModeList) : SettingValue() {
+    data class AncModes(
+        val list: AncModeList,
+        /**
+         * `false` for the three-boolean form (fields 1–3 only, no Adaptive) expected from the Gen 1 (qzed/pbpctrl's 2022 `AncrGestureLoop` had fields 1–3;
+         * field 4 came in 2025 for the Pro 2). 🟡 until a Gen 1 capture shows it. The repository accepts that form only from a Gen 1.
+         */
+        val adaptiveReported: Boolean = true,
+    ) : SettingValue() {
         override val field: Int get() = SettingsCodec.FIELD_ANC_MODE_LIST
     }
 
@@ -155,6 +162,20 @@ object SettingsCodec {
         return writeRequest(channelId, qju)
     }
 
+    /**
+     * Gen 1 support: `WriteSetting 4:{7:{1:{4:{1:<left>}} 2:{4:{1:<right>}}}}` — both buds in one write, the shape the Gen 1 reports
+     * (`gen1-step1-logcat.txt` 17:29:04.665: `4:{7:{1:{4:{1:5}} 2:{4:{1:5}}}}`) and the form qzed/pbpctrl writes to the Gen 1. 🟡 no official-app capture.
+     */
+    fun pressAndHoldBothRequest(channelId: Int, left: HoldAction, right: HoldAction): RpcPacket {
+        fun side(n: Int, action: HoldAction): ByteArray {
+            val qho = tag(QHO_VALUE, WIRETYPE_VARINT) + Varint.encode(action.wire)
+            val qik = tag(QIK_ACTION, WIRETYPE_LEN) + len(qho) + qho
+            return tag(n, WIRETYPE_LEN) + len(qik) + qik
+        }
+        val sides = side(QJU_LEFT, left) + side(QJU_RIGHT, right)
+        return writeRequest(channelId, tag(FIELD_PRESS_AND_HOLD, WIRETYPE_LEN) + len(sides) + sides)
+    }
+
     /** `WriteSetting 4:{17:<zigzag(value)>}` (ADR-045); [value] is clamped to −100 … +100 (ADR-026). */
     fun balanceRequest(channelId: Int, value: Int): RpcPacket {
         val v = value.coerceIn(-100, 100)
@@ -167,11 +188,14 @@ object SettingsCodec {
      * list (`CAP-056` 1689/1725/1786/1815/1843 on channel 19, `CAP-041` 2176/2192 on channel 21). `null` when fewer than [AncModeList.MIN_SELECTED] are ticked:
      * such a list can never be sent (the official app's rule, `hgj.java:165–168`).
      */
-    fun ancModeListRequest(channelId: Int, list: AncModeList): RpcPacket? {
+    fun ancModeListRequest(channelId: Int, list: AncModeList, withAdaptive: Boolean = true): RpcPacket? {
         if (!list.isValid) return null
+        // Gen 1 support: the Gen 1 reports exactly booleans 1–3 (`gen1-step1-logcat.txt` 17:29:04.789: `4:{12:{1:1 2:0 3:1}}`) — written in that same
+        // shape, never with a fourth; a list with Adaptive ticked cannot be written to it.
+        if (!withAdaptive && list.adaptive) return null
         fun flag(field: Int, on: Boolean) = tag(field, WIRETYPE_VARINT) + Varint.encode(if (on) 1 else 0)
         val qht = flag(QHT_NOISE_CANCELLATION, list.noiseCancellation) + flag(QHT_OFF, list.off) +
-            flag(QHT_TRANSPARENCY, list.transparency) + flag(QHT_ADAPTIVE, list.adaptive)
+            flag(QHT_TRANSPARENCY, list.transparency) + (if (withAdaptive) flag(QHT_ADAPTIVE, list.adaptive) else ByteArray(0))
         return writeRequest(channelId, tag(FIELD_ANC_MODE_LIST, WIRETYPE_LEN) + len(qht) + qht)
     }
 
@@ -269,8 +293,11 @@ object SettingsCodec {
      */
     private fun decodeAncModes(qht: ByteArray): SettingValue.AncModes? {
         val fields = Proto.fields(qht) ?: return null
-        if (fields.size != 4) return null
         val byNumber = fields.associateBy { it.number }
+        val threeFlags = setOf(QHT_NOISE_CANCELLATION, QHT_OFF, QHT_TRANSPARENCY)
+        // Gen 1 support: exactly fields 1–3, each once — the form expected from the Gen 1 (see [SettingValue.AncModes.adaptiveReported]).
+        if (fields.size == 3 && byNumber.keys == threeFlags) return decodeThreeAncModes(byNumber)
+        if (fields.size != 4) return null
         if (byNumber.keys != setOf(QHT_NOISE_CANCELLATION, QHT_OFF, QHT_TRANSPARENCY, QHT_ADAPTIVE)) return null
         fun flag(n: Int): Boolean? {
             val f = byNumber.getValue(n)
@@ -288,6 +315,27 @@ object SettingsCodec {
                 transparency = flag(QHT_TRANSPARENCY) ?: return null,
                 adaptive = flag(QHT_ADAPTIVE) ?: return null,
             ),
+        )
+    }
+
+    private fun decodeThreeAncModes(byNumber: Map<Int, Proto.Field>): SettingValue.AncModes? {
+        fun flag(n: Int): Boolean? {
+            val f = byNumber.getValue(n)
+            if (f.bytes != null) return null
+            return when (f.varint) {
+                0 -> false
+                1 -> true
+                else -> null
+            }
+        }
+        return SettingValue.AncModes(
+            AncModeList(
+                noiseCancellation = flag(QHT_NOISE_CANCELLATION) ?: return null,
+                off = flag(QHT_OFF) ?: return null,
+                transparency = flag(QHT_TRANSPARENCY) ?: return null,
+                adaptive = false,
+            ),
+            adaptiveReported = false,
         )
     }
 
